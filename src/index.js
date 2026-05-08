@@ -336,7 +336,7 @@ function buildRow(source, userId, page, blockText) {
   }
 
   const parts = [];
-  if (blockText)    parts.push(blockText);
+  if (blockText)    parts.push(stripHtml(blockText));
   if (meta.length)  parts.push(meta.join("\n"));
 
   return {
