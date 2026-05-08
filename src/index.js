@@ -273,13 +273,33 @@ async function notionBlockMap(notionKey, pageIds) {
 
 // ─── Notion プロパティ抽出 ──────────────────────────────────────────────────────
 
+// HTMLタグ・エンティティを除去してプレーンテキストに変換
+function stripHtml(str) {
+  return str
+    .replace(/<br\s*\/?>/gi, "
+")        // <br> → 改行
+    .replace(/<\/p>/gi, "
+")             // </p> → 改行
+    .replace(/<[^>]+>/g, "")             // 残りのタグを除去
+    .replace(/&nbsp;/g, " ")
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&amp;/g, "&")
+    .replace(/&quot;/g, '"')
+    .replace(/
+{3,}/g, "
+
+")          // 連続改行を最大2つに
+    .trim();
+}
+
 function extractTitle(props) {
   for (const v of Object.values(props)) {
     if (v?.type === "title") return (v.title || []).map(t => t.plain_text).join("").trim();
   }
   return "";
 }
-function extractRichText(f) { return (f?.rich_text || []).map(t => t.plain_text).join("").trim(); }
+function extractRichText(f) { return stripHtml((f?.rich_text || []).map(t => t.plain_text).join("").trim()); }
 function extractSelect(f)    { return f?.select?.name || ""; }
 function extractMultiSelect(f) { return (f?.multi_select || []).map(o => o.name); }
 
