@@ -92,8 +92,8 @@ async function handleDiag(env) {
     ZEUS_WORKER_SECRET: !!env.ZEUS_WORKER_SECRET,
     NOTION_API_KEY:     !!env.NOTION_API_KEY,
     VOYAGE_API_KEY:     !!env.VOYAGE_API_KEY,
-    VITE_SUPABASE_URL:  !!env.VITE_SUPABASE_URL,
-    VITE_SUPABASE_ANON_KEY: !!env.VITE_SUPABASE_ANON_KEY,
+    SUPABASE_URL:  !!(env.SUPABASE_URL || env.VITE_SUPABASE_URL),
+    SUPABASE_SERVICE_ROLE_KEY: !!env.SUPABASE_SERVICE_ROLE_KEY,
     MCP_DEFAULT_USER_ID: !!env.MCP_DEFAULT_USER_ID,
   };
   const missing = Object.entries(checks).filter(([, v]) => !v).map(([k]) => k);
@@ -276,20 +276,15 @@ async function notionBlockMap(notionKey, pageIds) {
 // HTMLタグ・エンティティを除去してプレーンテキストに変換
 function stripHtml(str) {
   return str
-    .replace(/<br\s*\/?>/gi, "
-")        // <br> → 改行
-    .replace(/<\/p>/gi, "
-")             // </p> → 改行
+    .replace(/<br\s*\/?>/gi, "\n")        // <br> → 改行
+    .replace(/<\/p>/gi, "\n")             // </p> → 改行
     .replace(/<[^>]+>/g, "")             // 残りのタグを除去
     .replace(/&nbsp;/g, " ")
     .replace(/&lt;/g, "<")
     .replace(/&gt;/g, ">")
     .replace(/&amp;/g, "&")
     .replace(/&quot;/g, '"')
-    .replace(/
-{3,}/g, "
-
-")          // 連続改行を最大2つに
+    .replace(/\n{3,}/g, "\n\n")          // 連続改行を最大2つに
     .trim();
 }
 
@@ -375,11 +370,16 @@ async function voyageEmbed(apiKey, texts) {
 
 // ─── Supabase ──────────────────────────────────────────────────────────────────
 
+// 2026-07-31 変更：公開キーから管理者キーへ切り替え。
+// 正本：2026-07-30 決定「画面は公開キーでデータベースに直接触らない」
+// ここはブラウザではなくサーバー側（毎晩の取り込み処理）なので管理者キーを使う場所。
+// 公開キーへの自動フォールバックは入れない（権限を外した瞬間に黙って止まるため）。
 function supaConfig(env) {
-  return {
-    url: (env.VITE_SUPABASE_URL || "").replace(/\/$/, ""),
-    key: env.VITE_SUPABASE_ANON_KEY,
-  };
+  const url = (env.SUPABASE_URL || env.VITE_SUPABASE_URL || "").replace(/\/$/, "");
+  const key = env.SUPABASE_SERVICE_ROLE_KEY;
+  if (!url) throw new Error("Supabase URL not configured (SUPABASE_URL / VITE_SUPABASE_URL)");
+  if (!key) throw new Error("SUPABASE_SERVICE_ROLE_KEY not configured");
+  return { url, key };
 }
 
 function supaAuthHeaders(key) {
