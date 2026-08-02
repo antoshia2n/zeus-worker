@@ -29,6 +29,7 @@ const NOTION_DBS = [
 const VOYAGE_BATCH   = 20;
 const SUPABASE_BATCH = 50;
 const BLOCK_CONCUR   = 5; // Workerはsubrequest制限なしのため並列数を増やせる
+const DELETE_BATCH   = 50; // 旧行の削除をURL長の安全な範囲に分割する
 
 // ─── エントリポイント ──────────────────────────────────────────────────────────
 
@@ -160,14 +161,18 @@ async function runSyncAll(env, forceFull = false, uid = null) {
 
 async function syncOneDb(env, userId, db, forceFull = false) {
   const { source, dbId, label, skipBlocks } = db;
+  const filter = `source_app=eq.${source}&user_id=eq.${encodeURIComponent(userId)}`;
 
-  // 1. 既存エントリ削除
-  await supaDelete(env, "zeus_items",
-    `source_app=eq.${source}&user_id=eq.${encodeURIComponent(userId)}`);
-
-  // 2. Notionページ全件取得
+  // 1. Notionページ全件取得（削除より先に行う）
+  //    取得に失敗すると上位の catch へ抜けるため、既存データは触られないまま残る。
   const pages = await notionAllPages(env.NOTION_API_KEY, dbId);
-  if (pages.length === 0) return { source, imported: 0 };
+
+  // 2. 0件なら入れ替えを中止する（既存を保持）
+  //    Notion側の一時的な不調と「本当に0件」を区別できないため、消さない側に倒す。
+  if (pages.length === 0) {
+    console.warn(`[zeus-worker] ${source}: Notion 0件のため入れ替えを中止（既存は保持）`);
+    return { source, imported: 0, skipped: "notion_empty" };
+  }
 
   // 3. ブロック本文取得（skipBlocks=falseのみ）
   const blockMap = skipBlocks
@@ -190,15 +195,22 @@ async function syncOneDb(env, userId, db, forceFull = false) {
     batch.forEach((r, idx) => { r.embedding = embs[idx]; });
   }
 
-  // 6. zeus_items 一括INSERT
+  // 6. 入れ替え対象の既存IDを控える（削除はINSERT成功後）
+  const oldIds = await supaSelectIds(env, "zeus_items", filter);
+
+  // 7. zeus_items 一括INSERT
   const projectId   = await upsertProject(env, userId, source, `Notionナレッジ: ${label}`);
   const insertedItems = await supaBulkInsert(env, "zeus_items", rows);
 
-  // 7. zeus_item_projects 一括INSERT
+  // 8. zeus_item_projects 一括INSERT
   await supaBulkInsert(env, "zeus_item_projects",
     insertedItems.map(r => ({ item_id: r.id, project_id: projectId })));
 
-  return { source, imported: pages.length };
+  // 9. 旧行を削除（ここまで来た＝新しい行は入っている）
+  //    zeus_item_projects は ON DELETE CASCADE のため紐付けも同時に消える。
+  await supaDeleteByIds(env, "zeus_items", oldIds);
+
+  return { source, imported: pages.length, replaced: oldIds.length };
 }
 
 // ─── Notion API ────────────────────────────────────────────────────────────────
@@ -219,7 +231,10 @@ async function notionAllPages(notionKey, dbId) {
     const res = await fetch(`https://api.notion.com/v1/databases/${dbId}/query`, {
       method: "POST", headers: notionHeaders(notionKey), body: JSON.stringify(body),
     });
-    if (!res.ok) { console.error(`[notion] DB ${dbId}: ${res.status}`); break; }
+    if (!res.ok) {
+      const body = await res.text().catch(() => "");
+      throw new Error(`Notion DB ${dbId}: ${res.status} ${body.slice(0, 200)}`);
+    }
     const d = await res.json();
     pages.push(...(d.results || []));
     cursor = d.has_more ? d.next_cursor : undefined;
@@ -394,6 +409,27 @@ async function supaDelete(env, table, filter) {
   if (!res.ok) {
     const body = await res.text().catch(() => "");
     throw new Error(`DELETE ${table}: ${res.status} ${body.slice(0, 200)}`);
+  }
+}
+
+async function supaSelectIds(env, table, filter) {
+  const { url, key } = supaConfig(env);
+  const res = await fetch(`${url}/rest/v1/${table}?${filter}&select=id`, {
+    headers: supaAuthHeaders(key),
+  });
+  if (!res.ok) {
+    const body = await res.text().catch(() => "");
+    throw new Error(`SELECT ${table}: ${res.status} ${body.slice(0, 200)}`);
+  }
+  const d = await res.json();
+  return (Array.isArray(d) ? d : []).map(r => r.id);
+}
+
+async function supaDeleteByIds(env, table, ids) {
+  if (!ids.length) return;
+  for (let i = 0; i < ids.length; i += DELETE_BATCH) {
+    const chunk = ids.slice(i, i + DELETE_BATCH);
+    await supaDelete(env, table, `id=in.(${chunk.join(",")})`);
   }
 }
 
