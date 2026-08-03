@@ -4,8 +4,14 @@
   "main": "src/index.js",
   "compatibility_date": "2026-04-01",
   "compatibility_flags": ["nodejs_compat"],
-  "observability": { "enabled": true },
-  "triggers": {
-    "crons": ["0 18 * * *"]
-  }
+  "observability": { "enabled": true }
+  // 2026-08-03：cron を廃止。
+  // Cloudflare Free プランの Cron Triggers はアカウントあたり 5 本が上限で、
+  // すでに 5 本（shia2n-mcp × 2 / shr-webhook / booking-kun-cron /
+  // high-shin-cron）が埋まっており、ここでの登録が拒否されてデプロイが
+  // 失敗し続けていた。
+  // 毎日 JST 03:00 の起動は shia2n-mcp 側の cron（0,30 * * * *）の
+  // UTC 18:00 分岐から POST /sync-all を叩く方式へ移行した。
+  // 復旧手段：ZEUS_WORKER_SECRET を Authorization: Bearer に付けて
+  //           POST https://zeus-worker.gameister1.workers.dev/sync-all
 }
