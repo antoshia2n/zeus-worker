@@ -4,7 +4,17 @@
   "main": "src/index.js",
   "compatibility_date": "2026-04-01",
   "compatibility_flags": ["nodejs_compat"],
-  "observability": { "enabled": true }
+  "observability": { "enabled": true },
+  // 2026-08-10 追加：取り込みの実行記録の置き場。
+  // shia2n-mcp が使っているものと同じ KV（あちらの binding 名は OAUTH_KV）を、
+  // こちらでは RUN_LOG_KV という名前でつなぐ。id が同じなら中身は同じ。
+  // 秘密ではないのでこの設定ファイル側で管理する（画面での追加は不要）。
+  "kv_namespaces": [
+    {
+      "binding": "RUN_LOG_KV",
+      "id": "eebf082265bf4d93906382a83d069d45"
+    }
+  ]
   // 2026-08-03：cron を廃止。
   // Cloudflare Free プランの Cron Triggers はアカウントあたり 5 本が上限で、
   // すでに 5 本（shia2n-mcp × 2 / shr-webhook / booking-kun-cron /
