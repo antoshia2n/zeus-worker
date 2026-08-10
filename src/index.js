@@ -31,6 +31,33 @@ const SUPABASE_BATCH = 50;
 const BLOCK_CONCUR   = 5; // Workerはsubrequest制限なしのため並列数を増やせる
 const DELETE_BATCH   = 50; // 旧行の削除をURL長の安全な範囲に分割する
 
+// ─── 実行記録 ─────────────────────────────────────────────────────────────────
+// 2026-08-10 追加：取り込みが何件入ったかを、shia2n-mcp と同じ形の記録として残す。
+//   置き場：shia2n-mcp と同じ KV。wrangler.jsonc で RUN_LOG_KV として同じ id を指す。
+//   鍵の形：cronlog:{名前}（shia2n-mcp の cron-log.ts と同一）。
+//   名前  ：zeus_import。shia2n-mcp 側の zeus_sync は「起動できた」の記録なので
+//           置き換えず、別の欄として並べる（同じ鍵に2つの意味を入れない）。
+// 記録の書き込みに失敗しても取り込みは止めない（記録は補助であって目的ではない）。
+
+const RUN_LOG_JOB = "zeus_import";
+const RUN_LOG_MAX = 5; // shia2n-mcp 側の保持件数と揃える
+
+async function appendRun(env, record) {
+  try {
+    if (!env.RUN_LOG_KV) {
+      console.error("[zeus-worker] RUN_LOG_KV not bound; run log skipped");
+      return;
+    }
+    const key  = `cronlog:${RUN_LOG_JOB}`;
+    const raw  = await env.RUN_LOG_KV.get(key);
+    const prev = raw ? JSON.parse(raw) : [];
+    const next = [record, ...(Array.isArray(prev) ? prev : [])].slice(0, RUN_LOG_MAX);
+    await env.RUN_LOG_KV.put(key, JSON.stringify(next));
+  } catch (e) {
+    console.error("[zeus-worker] failed to write run log:", e.message);
+  }
+}
+
 // ─── エントリポイント ──────────────────────────────────────────────────────────
 
 export default {
@@ -96,6 +123,8 @@ async function handleDiag(env) {
     SUPABASE_URL:  !!(env.SUPABASE_URL || env.VITE_SUPABASE_URL),
     SUPABASE_SERVICE_ROLE_KEY: !!env.SUPABASE_SERVICE_ROLE_KEY,
     MCP_DEFAULT_USER_ID: !!env.MCP_DEFAULT_USER_ID,
+    // 2026-08-10 追加：実行記録の置き場がつながっているか
+    RUN_LOG_KV:         !!env.RUN_LOG_KV,
   };
   const missing = Object.entries(checks).filter(([, v]) => !v).map(([k]) => k);
   return json({ ok: missing.length === 0, checks, missing });
@@ -139,10 +168,23 @@ async function handleSyncAll(request, env, ctx) {
 // ─── コア同期処理 ──────────────────────────────────────────────────────────────
 
 async function runSyncAll(env, forceFull = false, uid = null) {
-  const userId = uid || env.MCP_DEFAULT_USER_ID;
-  if (!userId) { console.error("[zeus-worker] MCP_DEFAULT_USER_ID not set"); return; }
+  const startedAt = Date.now();
+  const userId    = uid || env.MCP_DEFAULT_USER_ID;
+
+  if (!userId) {
+    console.error("[zeus-worker] MCP_DEFAULT_USER_ID not set");
+    await appendRun(env, {
+      at:          new Date().toISOString(),
+      status:      "failure",
+      count:       null,
+      detail:      "利用者の指定が無いため取り込みを行いませんでした（MCP_DEFAULT_USER_ID 未設定）",
+      duration_ms: Date.now() - startedAt,
+    });
+    return;
+  }
 
   const bySource = {};
+  const failed   = [];
   let   total    = 0;
 
   for (const db of NOTION_DBS) {
@@ -153,10 +195,32 @@ async function runSyncAll(env, forceFull = false, uid = null) {
     } catch (e) {
       console.error(`[zeus-worker] sync-all ${db.source}:`, e.message);
       bySource[db.source] = { error: e.message };
+      failed.push(`${db.label}：${String(e.message).slice(0, 120)}`);
     }
   }
 
   console.log(`[zeus-worker] sync-all done. total=${total}`, JSON.stringify(bySource));
+
+  // 5本それぞれの件数を並べる。1本でも失敗があれば failure にする
+  // （成功と表示されると、欠けたまま気づかないため）。
+  const breakdown = NOTION_DBS
+    .map((d) => {
+      const v = bySource[d.source];
+      return `${d.label} ${typeof v === "number" ? `${v} 件` : "失敗"}`;
+    })
+    .join(" / ");
+
+  const detail = failed.length === 0
+    ? `取り込み ${total} 件（${breakdown}）`
+    : `取り込み ${total} 件（${breakdown}）。失敗 ${failed.length} 本：${failed.join(" ／ ")}`;
+
+  await appendRun(env, {
+    at:          new Date().toISOString(),
+    status:      failed.length === 0 ? "success" : "failure",
+    count:       total,
+    detail:      detail.slice(0, 400),
+    duration_ms: Date.now() - startedAt,
+  });
 }
 
 async function syncOneDb(env, userId, db, forceFull = false) {
