@@ -40,7 +40,11 @@ const DELETE_BATCH   = 50; // 旧行の削除をURL長の安全な範囲に分�
 // 記録の書き込みに失敗しても取り込みは止めない（記録は補助であって目的ではない）。
 
 const RUN_LOG_JOB = "zeus_import";
-const RUN_LOG_MAX = 5; // shia2n-mcp 側の保持件数と揃える
+// 2026-08-14 変更：5 → 15。
+// 取り込み元ごとに 1 回ずつ実行を分けたため、1 日に 5 行が入るようになった。
+// 5 件のままだと 1 日ぶんしか残らず、前の日と比べられない。15 件で 3 日ぶん残る。
+// 読む側（shia2n-mcp の readAllRuns）は件数を切っていないので、こちらだけで決まる。
+const RUN_LOG_MAX = 15;
 
 async function appendRun(env, record) {
   try {
@@ -81,7 +85,7 @@ export default {
 
     // ルーティング
     if (url.pathname === "/sync-db" && request.method === "POST") {
-      return handleSyncDb(request, env);
+      return handleSyncDb(request, env, ctx);
     }
 
     if (url.pathname === "/sync-all" && request.method === "POST") {
@@ -130,8 +134,18 @@ async function handleDiag(env) {
   return json({ ok: missing.length === 0, checks, missing });
 }
 
-// 1DB同期（Settings画面から呼ばれる）
-async function handleSyncDb(request, env) {
+// 1DB同期（Settings画面から呼ばれる。2026-08-14 から毎朝の取り込みもここを使う）
+//
+// 2026-08-14 追加：body に async: true を付けると、すぐ返事を返して後ろで処理する。
+//   付けない呼び出し（Settings画面）はこれまでどおり、終わるまで待って件数を返す。
+//   画面の動きを変えないために、既存の形は残したまま枝分かれさせている。
+//
+// 毎朝の取り込みを 1 本ずつに分けた理由（2026-08-14）：
+//   5 本を 1 回の実行でまとめて処理していたため、1 回あたりの上限に収まらず、
+//   アウトプットDB から先が入らないまま 2026-08-09 以降ずっと止まっていた。
+//   1 本ずつ別の実行にすれば、1 本ぶんの重さで済み、どの本がどの理由で
+//   落ちたかも 1 本ごとに記録へ残る。
+async function handleSyncDb(request, env, ctx) {
   let body = {};
   try { body = await request.json(); } catch { /* 省略OK */ }
 
@@ -142,12 +156,55 @@ async function handleSyncDb(request, env) {
   const db = NOTION_DBS.find(d => d.source === source);
   if (!db) return json({ error: `unknown source: ${source}` }, 400);
 
+  const forceFull = body.force_full === true;
+
+  // すぐ返す形（毎朝の取り込み）。記録はこちらの経路でだけ残す。
+  // 画面からの手動実行まで記録に混ぜると、1 日 1 回の並びが読めなくなるため。
+  if (body.async === true) {
+    if (!ctx) return json({ error: "async not available here" }, 500);
+    ctx.waitUntil(runOneDb(env, uid, db, forceFull));
+    return json({ ok: true, message: "sync started", source, user_id: uid, force_full: forceFull });
+  }
+
+  // これまでどおり、終わるまで待って件数を返す形（Settings画面）
   try {
-    const result = await syncOneDb(env, uid, db);
+    const result = await syncOneDb(env, uid, db, forceFull);
     return json({ ok: true, ...result });
   } catch (e) {
     console.error(`[zeus-worker] sync-db ${source}:`, e.message);
     return json({ error: e.message }, 502);
+  }
+}
+
+// 取り込み元 1 本ぶんを処理し、その 1 本の実行記録を残す（2026-08-14 追加）。
+// 記録の書き込みに失敗しても取り込み自体は止めない（appendRun の中で受け止める）。
+async function runOneDb(env, userId, db, forceFull = false) {
+  const startedAt = Date.now();
+
+  try {
+    const result = await syncOneDb(env, userId, db, forceFull);
+    const detail = result.skipped === "notion_empty"
+      ? `${db.label}：Notion 側が 0 件のため入れ替えを中止（既存は保持）`
+      : `${db.label} ${result.imported} 件（入れ替え前 ${result.replaced} 件）`;
+
+    await appendRun(env, {
+      at:          new Date().toISOString(),
+      status:      "success",
+      count:       result.imported,
+      detail:      detail.slice(0, 400),
+      duration_ms: Date.now() - startedAt,
+    });
+  } catch (e) {
+    const reason = e instanceof Error ? e.message : String(e);
+    console.error(`[zeus-worker] sync-one ${db.source}:`, reason);
+
+    await appendRun(env, {
+      at:          new Date().toISOString(),
+      status:      "failure",
+      count:       null,
+      detail:      `${db.label}：${reason}`.slice(0, 400),
+      duration_ms: Date.now() - startedAt,
+    });
   }
 }
 
