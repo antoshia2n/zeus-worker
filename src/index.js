@@ -11,7 +11,13 @@
  * Cron: 毎日 JST 03:00（UTC 18:00）→ sync-all を自動実行
  *
  * 設計:
- *   - Cloudflare Workers に subrequest 上限なし（Pages Functions の 50回制限を回避）
+ *   - 呼び出しの上限（subrequest）は「無し」ではない。2026-08-15 に公式の一覧で確認した
+ *     実物は、1 回の呼び出しにつき有料 10,000 回・無料 50 回（設定で 10,000 は上げ下げ可）。
+ *     Cloudflare の内側（KV など）への呼び出しは、プランによらず 1 回の呼び出しにつき 1,000 回。
+ *     出どころ：https://developers.cloudflare.com/workers/platform/limits
+ *     ここを Pages Functions ではなく Worker に置いているのは、上限が消えるからではなく、
+ *     50 回より桁が大きいため。取り込み元 1 本が使うのは、いちばん多いアウトプットDB
+ *     （126 件）でも 300 回台で、有料の 10,000 には届かない。
  *   - waitUntil で長時間処理に対応
  *   - DB単位で独立して処理 → 1DBが失敗しても他は継続
  */
@@ -28,7 +34,8 @@ const NOTION_DBS = [
 
 const VOYAGE_BATCH   = 20;
 const SUPABASE_BATCH = 50;
-const BLOCK_CONCUR   = 5; // Workerはsubrequest制限なしのため並列数を増やせる
+const BLOCK_CONCUR   = 5; // 同時に開いておける外への接続が 1 回の呼び出しにつき 6 本まで
+                          // （有料・無料とも同じ）なので、その手前の 5 で止めている
 const DELETE_BATCH   = 50; // 旧行の削除をURL長の安全な範囲に分割する
 
 // ─── 実行記録 ─────────────────────────────────────────────────────────────────
