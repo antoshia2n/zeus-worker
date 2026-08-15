@@ -304,16 +304,42 @@ async function syncOneDb(env, userId, db, forceFull = false) {
   const rows = pages.map(p => buildRow(source, userId, p, blockMap.get(p.id) || ""));
 
   // 5. Voyage AI バッチ Embedding
+  //
+  // 2026-08-15 変更：ベクトルを作る呼び出しが失敗したときに、そのまま先へ進むのをやめた。
+  //   これまでは失敗した分を null のままにして 6 以降へ進み、空の行を新しく入れてから
+  //   ベクトルの入っていた古い行を消していた。呼び出し元には件数が返るため、
+  //   記録には「成功」と残り、中身だけが空に置き換わっていた。
+  //   2026-08-15 03:00 の inbox 18 件がこの経路で空になっている。
+  //   ここで throw すると 6 以降の書き込みと削除に一切入らないため、既存の行は
+  //   そのまま残る。呼び出し元（runOneDb）が失敗として記録し、下の理由の文字列も
+  //   その記録に入る（これまで理由は画面に出ないところにしか残っていなかった）。
+  //   2 の「Notion 側が 0 件なら入れ替えを中止」と同じ考え方で、消さない側に倒している。
+  const embedErrors = [];
   for (let i = 0; i < rows.length; i += VOYAGE_BATCH) {
     const batch = rows.slice(i, i + VOYAGE_BATCH);
-    let   embs;
     try {
-      embs = await voyageEmbed(env.VOYAGE_API_KEY, batch.map(r => `${r.title}\n\n${r.content}`));
+      const embs = await voyageEmbed(env.VOYAGE_API_KEY, batch.map(r => `${r.title}\n\n${r.content}`));
+      batch.forEach((r, idx) => { r.embedding = embs[idx]; });
     } catch (e) {
-      console.error(`[zeus-worker] embed ${source} offset ${i}:`, e.message);
-      embs = batch.map(() => null);
+      const reason = e instanceof Error ? e.message : String(e);
+      console.error(`[zeus-worker] embed ${source} offset ${i}:`, reason);
+      embedErrors.push(`${i + 1}件目から${batch.length}件：${reason}`);
     }
-    batch.forEach((r, idx) => { r.embedding = embs[idx]; });
+  }
+
+  if (embedErrors.length > 0) {
+    throw new Error(
+      `ベクトルを作れなかったため入れ替えを中止（既存は保持）。${embedErrors.length}組：${embedErrors.join(" ／ ")}`
+    );
+  }
+
+  // 例外は出ていないが中身が欠けている場合も、入れ替えに進まない。
+  // 返ってきた数が足りないと、末尾の行のベクトルが undefined のまま残るため。
+  const embedMissing = rows.filter(r => !Array.isArray(r.embedding) || r.embedding.length === 0).length;
+  if (embedMissing > 0) {
+    throw new Error(
+      `ベクトルの入っていない行が ${embedMissing} 件あるため入れ替えを中止（既存は保持）`
+    );
   }
 
   // 6. 入れ替え対象の既存IDを控える（削除はINSERT成功後）
