@@ -20,6 +20,21 @@
  *     （126 件）でも 300 回台で、有料の 10,000 には届かない。
  *   - waitUntil で長時間処理に対応
  *   - DB単位で独立して処理 → 1DBが失敗しても他は継続
+ *
+ * 2026-08-16 変更：ベクトルを作る先（Voyage）の回数制限に合わせて、送る間隔を空けた。
+ *   支払い方法が未登録のあいだ、Voyage は 1 分あたり 3 回・1 分あたり 1 万トークンに
+ *   絞られる（2026-08-16 の実行記録に理由の文字列が残って判明）。
+ *   これまでは 5 本を同時に走らせ、1 本の中でも 20 件ずつ間を空けずに送っていたため、
+ *   件数の多い inbox 18 件とアウトプットDB 126 件が 429 で弾かれ続けていた。
+ *   直したのは 3 つ。
+ *     1. Voyage への呼び出しに最低の間隔を置く（下の throttleVoyage）。
+ *        間隔は 1 回の実行の中で通しで効くので、取り込み元をまたいでも守られる。
+ *     2. 429 と 5xx は待ってやり直す。鍵違いなどの直らないものは 1 回で止める。
+ *     3. 全部まとめて回す側（runSyncAll）を、1 本ごとに記録を残す形へ変えた。
+ *        これで shia2n-mcp 側は 5 本を同時に起動する必要がなくなり、1 回叩くだけで
+ *        順番に流れる。記録は今までどおり 1 本につき 1 行残る。
+ *   支払い方法を登録すれば制限は上がるが、登録できるまで待つと取り込みが止まるため、
+ *   制限の低い側に合わせておく。登録後もこのままで動く（間隔が余るだけ）。
  */
 
 // ─── DB定義 ────────────────────────────────────────────────────────────────────
@@ -33,6 +48,26 @@ const NOTION_DBS = [
 ];
 
 const VOYAGE_BATCH   = 20;
+
+// Voyage の回数制限に合わせた送り方（2026-08-16 追加）
+const VOYAGE_MIN_INTERVAL_MS = 21_000; // 1 分あたり 3 回に収める（20 秒ごと＋1 秒の余裕）
+const VOYAGE_RETRY_MAX       = 3;      // 429 と 5xx のときにやり直す回数
+const VOYAGE_RETRY_BASE_MS   = 25_000; // やり直しの待ち。25 秒 → 50 秒 → 75 秒
+const DB_GAP_MS              = 3_000;  // 取り込み元と取り込み元のあいだの小休止
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+// 直前に Voyage を呼んだ時刻。1 回の実行の中で共通に持つことで、
+// 組と組のあいだだけでなく、取り込み元をまたいだときも間隔が守られる。
+let lastVoyageCallAt = 0;
+
+async function throttleVoyage() {
+  const wait = VOYAGE_MIN_INTERVAL_MS - (Date.now() - lastVoyageCallAt);
+  if (wait > 0) await sleep(wait);
+  lastVoyageCallAt = Date.now();
+}
 const SUPABASE_BATCH = 50;
 const BLOCK_CONCUR   = 5; // 同時に開いておける外への接続が 1 回の呼び出しにつき 6 本まで
                           // （有料・無料とも同じ）なので、その手前の 5 で止めている
@@ -185,6 +220,10 @@ async function handleSyncDb(request, env, ctx) {
 
 // 取り込み元 1 本ぶんを処理し、その 1 本の実行記録を残す（2026-08-14 追加）。
 // 記録の書き込みに失敗しても取り込み自体は止めない（appendRun の中で受け止める）。
+//
+// 2026-08-16 追加：呼び出し元へ結果を返す（例外は投げない）。
+//   全部まとめて回す側（runSyncAll）が、1 本落ちても次へ進めるようにするため。
+//   返り値：{ ok: true, imported } または { ok: false, reason }
 async function runOneDb(env, userId, db, forceFull = false) {
   const startedAt = Date.now();
 
@@ -201,6 +240,8 @@ async function runOneDb(env, userId, db, forceFull = false) {
       detail:      detail.slice(0, 400),
       duration_ms: Date.now() - startedAt,
     });
+
+    return { ok: true, imported: result.imported, reason: "" };
   } catch (e) {
     const reason = e instanceof Error ? e.message : String(e);
     console.error(`[zeus-worker] sync-one ${db.source}:`, reason);
@@ -212,6 +253,8 @@ async function runOneDb(env, userId, db, forceFull = false) {
       detail:      `${db.label}：${reason}`.slice(0, 400),
       duration_ms: Date.now() - startedAt,
     });
+
+    return { ok: false, imported: 0, reason };
   }
 }
 
@@ -247,44 +290,34 @@ async function runSyncAll(env, forceFull = false, uid = null) {
     return;
   }
 
+  // 2026-08-16 変更：取り込み元を 1 本ずつ順番に処理し、記録も 1 本につき 1 行残す。
+  //   これまでは 5 本を回し終えたあとに全体で 1 行だけ書いていたため、
+  //   shia2n-mcp 側が 5 本を同時に起動する形をとる必要があった（記録を分けるため）。
+  //   同時に走らせると Voyage の 1 分あたり 3 回に当たるので、こちらで順番に流す。
+  //   記録の形は 1 本ずつ起動していたときと同じなので、読む側の直しは要らない。
   const bySource = {};
-  const failed   = [];
   let   total    = 0;
+  let   failed   = 0;
 
-  for (const db of NOTION_DBS) {
-    try {
-      const result   = await syncOneDb(env, userId, db, forceFull);
+  for (let i = 0; i < NOTION_DBS.length; i++) {
+    if (i > 0) await sleep(DB_GAP_MS);
+
+    const db     = NOTION_DBS[i];
+    const result = await runOneDb(env, userId, db, forceFull);
+
+    if (result.ok) {
       bySource[db.source] = result.imported;
-      total              += result.imported;
-    } catch (e) {
-      console.error(`[zeus-worker] sync-all ${db.source}:`, e.message);
-      bySource[db.source] = { error: e.message };
-      failed.push(`${db.label}：${String(e.message).slice(0, 120)}`);
+      total += result.imported;
+    } else {
+      bySource[db.source] = { error: result.reason };
+      failed += 1;
     }
   }
 
-  console.log(`[zeus-worker] sync-all done. total=${total}`, JSON.stringify(bySource));
-
-  // 5本それぞれの件数を並べる。1本でも失敗があれば failure にする
-  // （成功と表示されると、欠けたまま気づかないため）。
-  const breakdown = NOTION_DBS
-    .map((d) => {
-      const v = bySource[d.source];
-      return `${d.label} ${typeof v === "number" ? `${v} 件` : "失敗"}`;
-    })
-    .join(" / ");
-
-  const detail = failed.length === 0
-    ? `取り込み ${total} 件（${breakdown}）`
-    : `取り込み ${total} 件（${breakdown}）。失敗 ${failed.length} 本：${failed.join(" ／ ")}`;
-
-  await appendRun(env, {
-    at:          new Date().toISOString(),
-    status:      failed.length === 0 ? "success" : "failure",
-    count:       total,
-    detail:      detail.slice(0, 400),
-    duration_ms: Date.now() - startedAt,
-  });
+  console.log(
+    `[zeus-worker] sync-all done. total=${total} failed=${failed} elapsed_ms=${Date.now() - startedAt}`,
+    JSON.stringify(bySource)
+  );
 }
 
 async function syncOneDb(env, userId, db, forceFull = false) {
@@ -519,22 +552,52 @@ function buildRow(source, userId, page, blockText) {
 
 // ─── Voyage AI ─────────────────────────────────────────────────────────────────
 
+// 2026-08-16 改訂：送る前に間隔を空け、429（回数の超過）と 5xx（先方の不調）は
+//   待ってやり直す。鍵違いのような待っても直らないものは 1 回で止めて理由を返す。
+//   やり直しの回数と待ちは上の定数で決めている（最悪でも 1 組につき約 150 秒）。
 async function voyageEmbed(apiKey, texts) {
-  const res = await fetch("https://api.voyageai.com/v1/embeddings", {
-    method: "POST",
-    headers: { "Authorization": `Bearer ${apiKey}`, "Content-Type": "application/json" },
-    body: JSON.stringify({
-      model: "voyage-3.5",
-      input: texts.map(t => (t || "").slice(0, 120000)),
-      input_type: "document",
-      output_dimension: 1024,
-    }),
+  const payload = JSON.stringify({
+    model: "voyage-3.5",
+    input: texts.map(t => (t || "").slice(0, 120000)),
+    input_type: "document",
+    output_dimension: 1024,
   });
-  if (!res.ok) {
+
+  let lastReason = "";
+
+  for (let attempt = 0; attempt <= VOYAGE_RETRY_MAX; attempt++) {
+    if (attempt > 0) {
+      const waitMs = VOYAGE_RETRY_BASE_MS * attempt;
+      console.log(`[zeus-worker] voyage retry ${attempt}/${VOYAGE_RETRY_MAX} wait=${waitMs}ms reason=${lastReason.slice(0, 80)}`);
+      await sleep(waitMs);
+    }
+
+    await throttleVoyage();
+
+    let res;
+    try {
+      res = await fetch("https://api.voyageai.com/v1/embeddings", {
+        method: "POST",
+        headers: { "Authorization": `Bearer ${apiKey}`, "Content-Type": "application/json" },
+        body: payload,
+      });
+    } catch (e) {
+      lastReason = `Voyage への接続に失敗: ${e instanceof Error ? e.message : String(e)}`;
+      continue;
+    }
+
+    if (res.ok) {
+      return (await res.json()).data.map(d => d.embedding);
+    }
+
     const body = await res.text().catch(() => "");
-    throw new Error(`Voyage ${res.status}: ${body.slice(0, 200)}`);
+    lastReason = `Voyage ${res.status}: ${body.slice(0, 200)}`;
+
+    // 429（回数の超過）と 5xx（先方の不調）以外は、待っても結果が変わらない
+    if (res.status !== 429 && res.status < 500) break;
   }
-  return (await res.json()).data.map(d => d.embedding);
+
+  throw new Error(`${lastReason}（${VOYAGE_RETRY_MAX} 回やり直しても通りませんでした）`);
 }
 
 // ─── Supabase ──────────────────────────────────────────────────────────────────
