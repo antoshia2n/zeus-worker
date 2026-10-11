@@ -626,7 +626,7 @@ function supaConfig(env) {
 }
 
 function supaAuthHeaders(key) {
-  return { "Content-Type": "application/json", "apikey": key, "Authorization": `Bearer ${key}` };
+  return { "Content-Type": "application/json", "apikey": key, ...(/^eyJ/.test(String(key || "")) ? { Authorization: `Bearer ${key}` } : {}) };
 }
 
 async function supaDelete(env, table, filter) {
